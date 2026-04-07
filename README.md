@@ -175,10 +175,8 @@ If you use this code, please cite:
 
 ```bibtex
 @inproceedings{occlusion_forecasting_2025,
-  title     = {Uncertainty-Guided Occlusion-Aware Trajectory Forecasting},
-  author    = {[Authors]},
-  booktitle = {[Venue]},
-  year      = {2025}
+  title     = {Uncertainty Guided Interaction Networks: A Lightweight Approach for Occlusion Aware Trajectory Forecasting on Limited Data},
+  author    = {[Ajinkya Jadhav]}
 }
 ```
 
