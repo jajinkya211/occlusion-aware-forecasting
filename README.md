@@ -9,12 +9,12 @@ Official implementation of the paper:
 
 ## Core Idea
 
-Most trajectory forecasters treat all agents identically regardless of how well the sensor observed them. This is wrong. A cyclist half-hidden behind a bus should receive a wider uncertainty cone than a fully visible pedestrian — not because the model is less capable, but because the information was genuinely absent.
+Most trajectory forecasters treat all agents identically regardless of how well the sensor observed them. This is wrong. A cyclist half-hidden behind a bus should receive a wider uncertainty cone than a fully visible pedestrian,  not because the model is less capable, but because the information was genuinely absent.
 
 This work wires per-agent visibility scores directly into the model's internal representations using Feature-wise Linear Modulation (FiLM), injected at two points: before and after social attention. Two pairwise calibration losses then enforce the desired correlations during training:
 
-- `r(vis, sigma2)` — less-visible agents must receive higher predicted variance
-- `r(err, sigma2)` — higher-error agents must receive higher predicted variance
+- `r(vis, sigma2)`,  less-visible agents must receive higher predicted variance
+- `r(err, sigma2)`,  higher-error agents must receive higher predicted variance
 
 Neither property emerges from standard NLL training alone.
 
@@ -24,13 +24,13 @@ Neither property emerges from standard NLL training alone.
 
 | Metric | Value | Target | Status |
 |---|---|---|---|
-| minADE | 3.81 m | — | — |
-| minFDE | 5.23 m | — | — |
+| minADE | 3.81 m |,  |,  |
+| minFDE | 5.23 m |,  |,  |
 | r(vis, sigma2) | −0.211 | < −0.20 | PASS |
 | r(err, sigma2) | +0.352 | > +0.30 | PASS |
-| ECE | 0.315 | — | — |
-| CRPS | 2.00 m | — | — |
-| Miss Rate @95% CI | 28.4% | — | — |
+| ECE | 0.315 |,  |,  |
+| CRPS | 2.00 m |,  |,  |
+| Miss Rate @95% CI | 28.4% |,  |,  |
 
 ---
 
@@ -38,11 +38,11 @@ Neither property emerges from standard NLL training alone.
 
 ```
 past_trajectory
-    → TemporalEncoder          per-agent, batched
-    → VisibilityFiLM (pre)     conditions embeddings on visibility before social attention
-    → SpatialAttention x 2     models agent interactions
-    → VisibilityFiLM (post)    re-conditions after social aggregation
-    → MultiModalPredictionHead K=6 modes, aleatoric + epistemic variance
+    #  TemporalEncoder          per-agent, batched
+    #  VisibilityFiLM (pre)     conditions embeddings on visibility before social attention
+    #  SpatialAttention x 2     models agent interactions
+    #  VisibilityFiLM (post)    re-conditions after social aggregation
+    #  MultiModalPredictionHead K=6 modes, aleatoric + epistemic variance
 ```
 
 616K trainable parameters. Trains on a single GPU in ~3–4 hours for 300 epochs.
@@ -61,7 +61,7 @@ past_trajectory
 ├── evaluate.py      Full metric suite: ECE, CRPS, Brier, Miss Rate
 ├── ablation.py      Ablation study runner
 ├── visualise.py     All figures (training curves, trajectories, calibration scatter)
-├── main.py          Entry point — runs everything end to end
+├── main.py          Entry point,  runs everything end to end
 └── requirements.txt
 ```
 
@@ -164,8 +164,8 @@ Fill in exact numbers from `paper_results.json` after running.
 
 Throughout this codebase, two calibration metrics are used consistently:
 
-- **`r(vis, sigma2)`** — Pearson correlation between per-agent visibility score and mean predicted variance. A negative value means the model assigns higher uncertainty to less-visible agents.
-- **`r(err, sigma2)`** — Pearson correlation between per-agent prediction error (minADE) and mean predicted variance. A positive value means the model is more uncertain about agents it predicts poorly.
+- **`r(vis, sigma2)`**,  Pearson correlation between per-agent visibility score and mean predicted variance. A negative value means the model assigns higher uncertainty to less-visible agents.
+- **`r(err, sigma2)`**,  Pearson correlation between per-agent prediction error (minADE) and mean predicted variance. A positive value means the model is more uncertain about agents it predicts poorly.
 
 ---
 
