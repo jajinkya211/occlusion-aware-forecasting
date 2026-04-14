@@ -1,190 +1,184 @@
-import time
-from typing import Dict, List, Tuple
+"""
+ablation.py — Ablation study for UGIN.
 
+Trains four variants for 5 epochs each and reports ADE, r(err, sigma2_tot),
+r(vis, sigma2_epi) for each.
+
+Usage:
+    python ablation.py
+    python ablation.py --synthetic
+    python ablation.py --epochs 10
+"""
+import argparse, time
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import Config
-from losses import TotalLoss
-from model import OcclusionAwareForecaster, NoFiLMForecaster
-from train import clear_device_cache, pearson_r
+from src.config import (DEVICE, NUM_WORKERS, BATCH_SIZE, LR, WEIGHT_DECAY,
+                         POS_SCALE, HIDDEN_DIM, NUM_MODES, NUM_HEADS,
+                         N_TEMP_L, N_SPAT_L, DROPOUT, OBS_LEN, PRED_LEN,
+                         MAX_AGENTS, LAMBDA_CALIB, LAMBDA_ERR_CALIB,
+                         LAMBDA_REG, NUSCENES_DATAROOT, clear_device_cache)
+from src.model import OcclusionAwareForecaster, NoFiLMForecaster, TemporalOnlyForecaster
+from src.losses import TotalLoss
 
 
-def evaluate_calibration(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    cfg: Config,
-) -> Tuple[float, float, float]:
-    model.eval()
-    errors_list:       List[np.ndarray] = []
-    variances_list:    List[np.ndarray] = []
-    visibilities_list: List[np.ndarray] = []
+def run_ablation(MdlClass, loss_fn, label, train_loader, val_loader, epochs=5):
+    mdl = MdlClass(h=HIDDEN_DIM, T=PRED_LEN, K=NUM_MODES,
+                   heads=NUM_HEADS, tl=N_TEMP_L, sl=N_SPAT_L, drop=DROPOUT).to(DEVICE)
+    opt = torch.optim.AdamW(mdl.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    t0  = time.time()
 
-    with torch.no_grad():
-        for batch in loader:
-            past   = batch['past_trajectory'].to(device)
-            future = batch['future_trajectory'].to(device)
-            vis    = batch['visibility_mask'].to(device)
-            mask   = batch['agent_mask'].to(device)
-
-            out = model(past, vis, mask)
-
-            traj_cpu   = out['trajectories'].cpu()
-            logvar_cpu = out['log_variances'].cpu()
-            fut_cpu    = future.cpu()
-            vis_cpu    = vis.cpu()
-            mask_cpu   = mask.cpu()
-
-            gt_expanded = fut_cpu.permute(0, 2, 1, 3).unsqueeze(2).expand_as(traj_cpu)
-            per_agent_error    = (traj_cpu - gt_expanded).pow(2).sum(-1).sqrt().mean(-1).min(-1).values
-            per_agent_variance = logvar_cpu.clamp(-4.0, 1.0).exp().mean(dim=[2, 3, 4])
-
-            valid = mask_cpu
-            errors_list.append(per_agent_error[valid].numpy())
-            variances_list.append(per_agent_variance[valid].numpy())
-            visibilities_list.append(vis_cpu.squeeze(-1)[valid].numpy())
-
-    errors_all       = np.concatenate(errors_list)
-    variances_all    = np.concatenate(variances_list)
-    visibilities_all = np.concatenate(visibilities_list)
-
-    return (
-        float(errors_all.mean() * cfg.pos_scale),
-        pearson_r(errors_all, variances_all),
-        pearson_r(visibilities_all, variances_all),
-    )
-
-
-def run_ablation_variant(
-    model_class,
-    loss_fn: TotalLoss,
-    label: str,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    cfg: Config,
-    num_epochs: int = 5,
-) -> Tuple[float, float, float]:
-    mdl = model_class(
-        hidden_dim=cfg.hidden_dim,
-        pred_len=cfg.pred_len,
-        num_modes=cfg.num_modes,
-        num_heads=cfg.num_heads,
-        num_temporal_layers=cfg.num_temporal_layers,
-        num_spatial_layers=cfg.num_spatial_layers,
-        film_embed_dim=cfg.film_embed_dim,
-        dropout=cfg.dropout,
-    ).to(device)
-    opt = torch.optim.AdamW(mdl.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-
-    t_start = time.time()
+    # Train
     mdl.train()
-    for _ in range(num_epochs):
-        for batch in train_loader:
-            past   = batch['past_trajectory'].to(device)
-            future = batch['future_trajectory'].to(device)
-            vis    = batch['visibility_mask'].to(device)
-            mask   = batch['agent_mask'].to(device)
+    for _ in range(epochs):
+        for b in train_loader:
+            past = b['past_trajectory'].to(DEVICE)
+            fut  = b['future_trajectory'].to(DEVICE)
+            vis  = b['visibility_mask'].to(DEVICE)
+            msk  = b['agent_mask'].to(DEVICE)
             opt.zero_grad(set_to_none=True)
-            preds = mdl(past, vis, mask)
-            losses = loss_fn(
-                preds,
-                {'future_trajectory': future, 'agent_mask': mask, 'visibility_mask': vis},
-            )
-            if torch.isfinite(losses['total']):
-                losses['total'].backward()
+            p = mdl(past, vis, msk)
+            L = loss_fn(p, {'future_trajectory': fut, 'agent_mask': msk, 'visibility_mask': vis})
+            if torch.isfinite(L['total']):
+                L['total'].backward()
+                for param in mdl.parameters():
+                    if param.grad is not None:
+                        param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                torch.nn.utils.clip_grad_norm_(mdl.parameters(), 0.5)
                 opt.step()
 
-    result = evaluate_calibration(mdl, val_loader, device, cfg)
-    elapsed = time.time() - t_start
+    # Evaluate
+    mdl.eval()
+    all_e, all_v_tot, all_v_epi, all_vis_ = [], [], [], []
+    with torch.no_grad():
+        for b in val_loader:
+            past = b['past_trajectory'].to(DEVICE)
+            fut  = b['future_trajectory'].to(DEVICE)
+            vis  = b['visibility_mask'].to(DEVICE)
+            msk  = b['agent_mask'].to(DEVICE)
+            o    = mdl(past, vis, msk)
+            tc   = o['trajectories'].cpu()
+            lv_t = o['log_var_total'].cpu()
+            lv_e = o['log_var_epi'].cpu()
+            fc   = fut.cpu(); vc = vis.cpu(); mc = msk.cpu()
+            gt_e = fc.permute(0, 2, 1, 3).unsqueeze(2).expand_as(tc)
+            err  = (tc - gt_e).pow(2).sum(-1).sqrt().mean(-1).min(-1).values
+            var_tot = lv_t.clamp(-4, 1).exp().mean([2, 3, 4])
+            var_epi = lv_e.clamp(-4, 1).exp().mean([2, 3, 4])
+            vld = mc
+            all_e.append(err[vld].numpy())
+            all_v_tot.append(var_tot[vld].numpy())
+            all_v_epi.append(var_epi[vld].numpy())
+            all_vis_.append(vc.squeeze(-1)[vld].numpy())
 
-    r_err_ok = result[1] > cfg.target_r_err_sigma2
-    r_vis_ok = result[2] < cfg.target_r_vis_sigma2
-    print(
-        f'{label:<26}: '
-        f'minADE={result[0]:.2f}m  '
-        f'r(err,sigma2)={"OK " if r_err_ok else "   "}{result[1]:+.3f}  '
-        f'r(vis,sigma2)={"OK " if r_vis_ok else "   "}{result[2]:+.3f}  '
-        f'({elapsed:.0f}s)'
-    )
+    ae     = np.concatenate(all_e)
+    av_tot = np.concatenate(all_v_tot)
+    av_epi = np.concatenate(all_v_epi)
+    avis   = np.concatenate(all_vis_)
 
+    def rp(a, b):
+        c = np.corrcoef(a, b)[0, 1]
+        return float(c) if not np.isnan(c) else 0.0
+
+    result = (float(ae.mean() * POS_SCALE), rp(ae, av_tot), rp(avis, av_epi))
+    print(f'{label:<26}: ADE={result[0]:.2f}m  '
+          f'r(err,tot)={result[1]:.3f}  r(vis,epi)={result[2]:.3f}  '
+          f'({time.time()-t0:.0f}s)')
     del mdl, opt
-    clear_device_cache(device)
+    clear_device_cache()
     return result
 
 
-def run_all_ablations(
-    full_model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    cfg: Config,
-) -> Dict[str, Tuple[float, float, float]]:
-    print('Running ablation study (5 epochs per variant)...')
-    print()
+def main(args):
+    # ── Data ──────────────────────────────────────────────────────────────────
+    if args.synthetic:
+        from src.datasets import get_synthetic_splits
+        train_ds, val_ds = get_synthetic_splits()
+    else:
+        from nuscenes.nuscenes import NuScenes
+        from src.datasets import NuScenesDataset, get_nuscenes_splits
+        nusc = NuScenes(version='v1.0-mini', dataroot=NUSCENES_DATAROOT, verbose=False)
+        tr_t, va_t = get_nuscenes_splits(nusc)
+        train_ds = NuScenesDataset(nusc, tr_t, OBS_LEN, PRED_LEN, MAX_AGENTS)
+        val_ds   = NuScenesDataset(nusc, va_t, OBS_LEN, PRED_LEN, MAX_AGENTS)
 
-    ablation_results: Dict[str, Tuple[float, float, float]] = {}
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, drop_last=True)
+    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS)
 
-    full_result = evaluate_calibration(full_model, val_loader, device, cfg)
-    ablation_results['Full model (ours)'] = full_result
-    print(
-        f'{"Full model (ours)":<26}: '
-        f'minADE={full_result[0]:.2f}m  '
-        f'r(err,sigma2)={full_result[1]:+.3f}  '
-        f'r(vis,sigma2)={full_result[2]:+.3f}  (from checkpoint)'
-    )
+    epochs = args.epochs
+    print(f'Running ablations ({epochs} epochs each)...\n')
 
-    ablation_results['No FiLM conditioning'] = run_ablation_variant(
+    results = {}
+
+    # Full model from checkpoint
+    full_mdl = OcclusionAwareForecaster(
+        h=HIDDEN_DIM, T=PRED_LEN, K=NUM_MODES,
+        heads=NUM_HEADS, tl=N_TEMP_L, sl=N_SPAT_L, drop=DROPOUT).to(DEVICE)
+    ckpt = torch.load(args.checkpoint, map_location=DEVICE)
+    full_mdl.load_state_dict(ckpt['state'])
+    full_mdl.eval()
+    all_e, all_v_tot, all_v_epi, all_vis_ = [], [], [], []
+    with torch.no_grad():
+        for b in val_loader:
+            past = b['past_trajectory'].to(DEVICE); fut = b['future_trajectory'].to(DEVICE)
+            vis  = b['visibility_mask'].to(DEVICE);  msk = b['agent_mask'].to(DEVICE)
+            o = full_mdl(past, vis, msk)
+            tc = o['trajectories'].cpu(); lv_t = o['log_var_total'].cpu()
+            lv_e = o['log_var_epi'].cpu(); vc = vis.cpu(); mc = msk.cpu()
+            gt_e = fut.cpu().permute(0, 2, 1, 3).unsqueeze(2).expand_as(tc)
+            err     = (tc - gt_e).pow(2).sum(-1).sqrt().mean(-1).min(-1).values
+            var_tot = lv_t.clamp(-4, 1).exp().mean([2, 3, 4])
+            var_epi = lv_e.clamp(-4, 1).exp().mean([2, 3, 4])
+            vld = mc
+            all_e.append(err[vld].numpy()); all_v_tot.append(var_tot[vld].numpy())
+            all_v_epi.append(var_epi[vld].numpy()); all_vis_.append(vc.squeeze(-1)[vld].numpy())
+    ae = np.concatenate(all_e); av_tot = np.concatenate(all_v_tot)
+    av_epi = np.concatenate(all_v_epi); avis = np.concatenate(all_vis_)
+    def rp(a, b):
+        c = np.corrcoef(a, b)[0, 1]; return float(c) if not np.isnan(c) else 0.0
+    results['Full Model (ours)'] = (float(ae.mean()*POS_SCALE), rp(ae,av_tot), rp(avis,av_epi))
+    print(f'Full Model (trained)     : ADE={results["Full Model (ours)"][0]:.2f}m  '
+          f'r(err,tot)={results["Full Model (ours)"][1]:.3f}  '
+          f'r(vis,epi)={results["Full Model (ours)"][2]:.3f}')
+    del full_mdl; clear_device_cache()
+
+    # Ablation variants
+    results['No VisibilityFiLM'] = run_ablation(
         NoFiLMForecaster,
-        TotalLoss(
-            lambda_vis_calib=cfg.lambda_vis_calib,
-            lambda_err_calib=cfg.lambda_err_calib,
-            lambda_regression=cfg.lambda_regression,
-        ),
-        'No FiLM conditioning',
-        train_loader, val_loader, device, cfg,
-    )
+        TotalLoss(lc=LAMBDA_CALIB, lec=LAMBDA_ERR_CALIB, lreg=LAMBDA_REG),
+        'No VisibilityFiLM', train_loader, val_loader, epochs)
 
-    ablation_results['No vis calibration loss'] = run_ablation_variant(
+    results['No vis_calib (lc=0)'] = run_ablation(
         OcclusionAwareForecaster,
-        TotalLoss(
-            lambda_vis_calib=0.0,
-            lambda_err_calib=cfg.lambda_err_calib,
-            lambda_regression=cfg.lambda_regression,
-        ),
-        'No vis calibration loss',
-        train_loader, val_loader, device, cfg,
-    )
+        TotalLoss(lc=0.0, lec=LAMBDA_ERR_CALIB, lreg=LAMBDA_REG),
+        'No vis_calib (lc=0)', train_loader, val_loader, epochs)
 
-    ablation_results['No err calibration loss'] = run_ablation_variant(
+    results['No err_calib (lec=0)'] = run_ablation(
         OcclusionAwareForecaster,
-        TotalLoss(
-            lambda_vis_calib=cfg.lambda_vis_calib,
-            lambda_err_calib=0.0,
-            lambda_regression=cfg.lambda_regression,
-        ),
-        'No err calibration loss',
-        train_loader, val_loader, device, cfg,
-    )
+        TotalLoss(lc=LAMBDA_CALIB, lec=0.0, lreg=LAMBDA_REG),
+        'No err_calib (lec=0)', train_loader, val_loader, epochs)
 
+    # Print table
     print()
-    print('=' * 72)
-    print('  ABLATION TABLE  (5-epoch training except Full model)')
-    print('=' * 72)
-    print(f'  {"Variant":<26}  {"minADE (m)":>10}  {"r(err,s2)":>10}  {"r(vis,s2)":>10}')
-    print('  ' + '─' * 60)
-    for name, (ade, r_err, r_vis) in ablation_results.items():
-        r_err_ok = r_err > cfg.target_r_err_sigma2
-        r_vis_ok = r_vis < cfg.target_r_vis_sigma2
-        tag = '  <- ours' if 'ours' in name else ''
-        print(
-            f'  {name:<26}  {ade:>10.2f}  '
-            f'{"OK " if r_err_ok else "   "}{r_err:>7.3f}  '
-            f'{"OK " if r_vis_ok else "   "}{r_vis:>7.3f}{tag}'
-        )
-    print('=' * 72)
+    print('=' * 68)
+    print(f'  ABLATION TABLE  ({epochs}-epoch training)')
+    print('=' * 68)
+    print(f'  {"Variant":<26}  {"ADE (m)":>8}  {"r(err,tot)":>10}  {"r(vis,epi)":>10}')
+    print('  ' + '-' * 60)
+    for name, (ade, ev, sv) in results.items():
+        tag  = ' <- ours' if 'ours' in name else ''
+        ev_s = 'PASS' if ev > 0.3  else '    '
+        sv_s = 'PASS' if sv < -0.2 else '    '
+        print(f'  {name:<26}  {ade:>8.2f}  {ev_s} {ev:>5.3f}  {sv_s} {sv:>5.3f}{tag}')
+    print('=' * 68)
 
-    return ablation_results
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='UGIN ablation study')
+    parser.add_argument('--checkpoint', default='best_model.pth')
+    parser.add_argument('--synthetic', action='store_true')
+    parser.add_argument('--epochs', type=int, default=5)
+    main(parser.parse_args())

@@ -1,253 +1,186 @@
-import gc
-import time
-from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple
+"""
+train.py — Training loop for UGIN.
 
+Usage:
+    python train.py                      # nuScenes (default)
+    python train.py --synthetic          # synthetic dataset (no download needed)
+    python train.py --epochs 150         # override epoch count
+"""
+import argparse, time, json
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import Config
-from losses import TotalLoss
+from src.config import (DEVICE, NUM_WORKERS, BATCH_SIZE, EPOCHS, LR,
+                         WEIGHT_DECAY, WARMUP_EPOCHS, LAMBDA_CALIB,
+                         LAMBDA_ERR_CALIB, LAMBDA_REG, POS_SCALE,
+                         HIDDEN_DIM, NUM_MODES, NUM_HEADS, N_TEMP_L, N_SPAT_L,
+                         DROPOUT, OBS_LEN, PRED_LEN, MAX_AGENTS,
+                         NUSCENES_DATAROOT, USE_SYNTHETIC, clear_device_cache)
+from src.model import OcclusionAwareForecaster
+from src.losses import TotalLoss
 
 
-def clear_device_cache(device: torch.device) -> None:
-    gc.collect()
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-    elif device.type == 'mps':
-        try:
-            getattr(torch.mps, 'empty_cache', lambda: None)()
-        except Exception:
-            pass
-
-
-def pearson_r(a: np.ndarray, b: np.ndarray) -> float:
-    corr = np.corrcoef(a, b)[0, 1]
-    return float(corr) if not np.isnan(corr) else 0.0
+def masked_mean(x, m):
+    return (x * m.float()).sum() / (m.float().sum() + 1e-8)
 
 
 @torch.no_grad()
-def compute_min_ade_fde(
-    trajectories: torch.Tensor,
-    ground_truth: torch.Tensor,
-    agent_mask: torch.Tensor,
-) -> Tuple[float, float]:
-    from losses import masked_mean
-    gt = ground_truth.permute(0, 2, 1, 3).unsqueeze(2).expand_as(trajectories)
-    l2 = (trajectories - gt).pow(2).sum(-1).sqrt()
-    min_ade = masked_mean(l2.mean(-1).min(-1).values, agent_mask).item()
-    min_fde = masked_mean(l2[:, :, :, -1].min(-1).values, agent_mask).item()
-    return min_ade, min_fde
+def ade_fde(traj, gt, mask):
+    gt_ = gt.permute(0, 2, 1, 3).unsqueeze(2).expand_as(traj)
+    l2  = (traj - gt_).pow(2).sum(-1).sqrt()
+    return (masked_mean(l2.mean(-1).min(-1).values, mask).item(),
+            masked_mean(l2[:, :, :, -1].min(-1).values, mask).item())
 
 
-def run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    loss_fn: TotalLoss,
-    optimizer: Optional[torch.optim.Optimizer],
-    device: torch.device,
-    cfg: Config,
-    is_training: bool,
-) -> Dict[str, float]:
-    model.train() if is_training else model.eval()
-
-    loss_accumulator = {
-        k: 0.0 for k in
-        ['total', 'nll', 'regression', 'cls', 'vis_calib', 'err_calib', 'smooth']
-    }
-    sum_ade = sum_fde = num_valid_batches = num_skipped = 0
-
-    all_errors:       List[np.ndarray] = []
-    all_variances:    List[np.ndarray] = []
-    all_visibilities: List[np.ndarray] = []
-
-    ctx = torch.enable_grad() if is_training else torch.no_grad()
+def run_epoch(model, loader, loss_fn, opt, device, train):
+    model.train() if train else model.eval()
+    tots = {k: 0.0 for k in ['total', 'nll', 'reg', 'cls', 'vis_calib', 'err_calib', 'smooth']}
+    as_ = fs_ = n = skipped = 0
+    all_err, all_var, all_vis = [], [], []
+    ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for batch in loader:
-            past   = batch['past_trajectory'].to(device)
-            future = batch['future_trajectory'].to(device)
-            vis    = batch['visibility_mask'].to(device)
-            mask   = batch['agent_mask'].to(device)
-
-            if is_training:
-                optimizer.zero_grad(set_to_none=True)
-
-            predictions = model(past, vis, mask)
-            losses = loss_fn(
-                predictions,
-                {'future_trajectory': future, 'agent_mask': mask, 'visibility_mask': vis},
-            )
-
-            if not torch.isfinite(losses['total']):
-                num_skipped += 1
+        for b in loader:
+            past = b['past_trajectory'].to(device)
+            fut  = b['future_trajectory'].to(device)
+            vis  = b['visibility_mask'].to(device)
+            msk  = b['agent_mask'].to(device)
+            if train:
+                opt.zero_grad(set_to_none=True)
+            p = model(past, vis, msk)
+            L = loss_fn(p, {'future_trajectory': fut, 'agent_mask': msk, 'visibility_mask': vis})
+            if not torch.isfinite(L['total']):
+                skipped += 1
                 continue
-
-            if is_training:
-                losses['total'].backward()
+            if train:
+                L['total'].backward()
                 for param in model.parameters():
                     if param.grad is not None:
-                        param.grad = torch.nan_to_num(
-                            param.grad, nan=0.0, posinf=0.0, neginf=0.0
-                        )
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-                optimizer.step()
-
+                        param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
             with torch.no_grad():
-                traj_cpu   = predictions['trajectories'].cpu()
-                logvar_cpu = predictions['log_variances'].cpu()
-                fut_cpu    = future.cpu()
-                vis_cpu    = vis.cpu()
-                mask_cpu   = mask.cpu()
-
-                min_ade, min_fde = compute_min_ade_fde(traj_cpu, fut_cpu, mask_cpu)
-
-                gt_expanded = fut_cpu.permute(0, 2, 1, 3).unsqueeze(2).expand_as(traj_cpu)
-                per_agent_error    = (traj_cpu - gt_expanded).pow(2).sum(-1).sqrt().mean(-1).min(-1).values
-                per_agent_variance = logvar_cpu.clamp(-4.0, 1.0).exp().mean(dim=[2, 3, 4])
-                per_agent_vis      = vis_cpu.squeeze(-1)
-
-                valid = mask_cpu
-                all_errors.append(per_agent_error[valid].numpy())
-                all_variances.append(per_agent_variance[valid].numpy())
-                all_visibilities.append(per_agent_vis[valid].numpy())
-
-            if np.isfinite(min_ade) and np.isfinite(min_fde):
-                for key in loss_accumulator:
-                    loss_accumulator[key] += losses[key].item()
-                sum_ade += min_ade
-                sum_fde += min_fde
-                num_valid_batches += 1
-
-    if num_valid_batches == 0:
-        nan_keys = list(loss_accumulator.keys()) + [
-            'min_ade', 'min_fde', 'r_vis_sigma2', 'r_err_sigma2', 'skipped_batches'
-        ]
-        return {k: float('nan') for k in nan_keys}
-
-    errors_all       = np.concatenate(all_errors)
-    variances_all    = np.concatenate(all_variances)
-    visibilities_all = np.concatenate(all_visibilities)
-
-    results = {k: v / num_valid_batches for k, v in loss_accumulator.items()}
-    results['min_ade']         = sum_ade / num_valid_batches
-    results['min_fde']         = sum_fde / num_valid_batches
-    results['r_vis_sigma2']    = pearson_r(visibilities_all, variances_all)
-    results['r_err_sigma2']    = pearson_r(errors_all, variances_all)
-    results['skipped_batches'] = num_skipped
-    return results
+                a, f = ade_fde(p['trajectories'], fut, msk)
+                gt_e = fut.permute(0, 2, 1, 3).unsqueeze(2).expand_as(p['trajectories'])
+                err  = (p['trajectories'] - gt_e).pow(2).sum(-1).sqrt().mean(-1).min(-1).values
+                var  = p['log_var_total'].clamp(-4, 1).exp().mean([2, 3, 4])
+                vld  = msk.cpu()
+                all_err.append(err.cpu()[vld].numpy())
+                all_var.append(var.cpu()[vld].numpy())
+                all_vis.append(vis.squeeze(-1).cpu()[vld].numpy())
+            if np.isfinite(a) and np.isfinite(f):
+                for k in tots:
+                    tots[k] += L[k].item()
+                as_ += a
+                fs_ += f
+                n   += 1
+    if n == 0:
+        return {k: float('nan') for k in list(tots.keys()) + ['ade', 'fde', 'ev', 'sv', 'skipped']}
+    ae   = np.concatenate(all_err)
+    av   = np.concatenate(all_var)
+    avis = np.concatenate(all_vis)
+    def rp(a, b):
+        c = np.corrcoef(a, b)[0, 1]
+        return float(c) if not np.isnan(c) else 0.0
+    r = {k: v / n for k, v in tots.items()}
+    r.update({'ade': as_ / n, 'fde': fs_ / n,
+              'ev': rp(ae, av), 'sv': rp(avis, av), 'skipped': skipped})
+    return r
 
 
-def build_lr_schedule(cfg: Config):
-    def lr_schedule(epoch: int) -> float:
-        if epoch < cfg.warmup_epochs:
-            return (epoch + 1) / cfg.warmup_epochs
-        progress = (epoch - cfg.warmup_epochs) / max(1, cfg.epochs - cfg.warmup_epochs)
-        return max(cfg.min_lr_ratio, 0.5 * (1.0 + np.cos(np.pi * progress)))
-    return lr_schedule
+def lr_lambda(ep):
+    if ep < WARMUP_EPOCHS:
+        return (ep + 1) / WARMUP_EPOCHS
+    prog = (ep - WARMUP_EPOCHS) / max(1, EPOCHS - WARMUP_EPOCHS)
+    return max(0.05, 0.5 * (1 + np.cos(np.pi * prog)))
 
 
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    cfg: Config,
-    device: torch.device,
-) -> List[Dict]:
-    loss_fn = TotalLoss(
-        lambda_vis_calib=cfg.lambda_vis_calib,
-        lambda_err_calib=cfg.lambda_err_calib,
-        lambda_regression=cfg.lambda_regression,
-        lambda_smooth=cfg.lambda_smooth,
-    )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.999),
-    )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, build_lr_schedule(cfg))
+def main(args):
+    # ── Data ──────────────────────────────────────────────────────────────────
+    if args.synthetic:
+        from src.datasets import get_synthetic_splits
+        train_ds, val_ds = get_synthetic_splits(n=1500)
+    else:
+        from nuscenes.nuscenes import NuScenes
+        from src.datasets import NuScenesDataset, get_nuscenes_splits
+        nusc = NuScenes(version='v1.0-mini', dataroot=NUSCENES_DATAROOT, verbose=False)
+        train_toks, val_toks = get_nuscenes_splits(nusc)
+        train_ds = NuScenesDataset(nusc, train_toks, OBS_LEN, PRED_LEN, MAX_AGENTS)
+        val_ds   = NuScenesDataset(nusc, val_toks,   OBS_LEN, PRED_LEN, MAX_AGENTS)
 
-    history: List[Dict] = []
-    best_composite_score = float('inf')
-    consecutive_nan_epochs = 0
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS)
+    print(f'Train: {len(train_ds)}  Val: {len(val_ds)}  |  {len(train_loader)} batches/ep')
 
-    header = (
-        f"{'Ep':>4}  {'Loss':>8}  {'minADE(m)':>9}  "
-        f"{'r(err,s2)':>9}  {'r(vis,s2)':>9}  {'LR':>8}"
-    )
-    print(header)
-    print('─' * len(header))
+    # ── Model + optimiser ─────────────────────────────────────────────────────
+    model = OcclusionAwareForecaster(
+        h=HIDDEN_DIM, T=PRED_LEN, K=NUM_MODES,
+        heads=NUM_HEADS, tl=N_TEMP_L, sl=N_SPAT_L, drop=DROPOUT).to(DEVICE)
+    print(f'Parameters: {model.count_parameters():,}  |  device={DEVICE}')
 
-    for epoch in range(cfg.epochs):
-        t_start = time.time()
-        train_metrics = run_epoch(model, train_loader, loss_fn, optimizer, device, cfg, True)
-        val_metrics   = run_epoch(model, val_loader,   loss_fn, None,      device, cfg, False)
+    loss_fn   = TotalLoss(lc=LAMBDA_CALIB, lec=LAMBDA_ERR_CALIB, lreg=LAMBDA_REG)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
+                                   weight_decay=WEIGHT_DECAY, betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    history = []
+    best_score = float('inf')
+    consecutive_nan = 0
+    epochs = args.epochs or EPOCHS
+
+    hdr = f"{'Ep':>4}  {'Loss':>8}  {'ADE_m':>6}  {'Err-r':>7}  {'Vis-r':>7}  {'LR':>8}"
+    print(hdr)
+    print('-' * len(hdr))
+
+    for ep in range(epochs):
+        t0 = time.time()
+        tr = run_epoch(model, train_loader, loss_fn, optimizer, DEVICE, True)
+        va = run_epoch(model, val_loader,   loss_fn, None,      DEVICE, False)
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+        lr_now = optimizer.param_groups[0]['lr']
 
-        record = {'epoch': epoch + 1}
-        record.update({f'train_{k}': v for k, v in train_metrics.items()})
-        record.update({f'val_{k}':   v for k, v in val_metrics.items()})
-        history.append(record)
+        row = {'ep': ep + 1}
+        row.update({f'tr_{k}': v for k, v in tr.items()})
+        row.update({f'va_{k}': v for k, v in va.items()})
+        history.append(row)
 
-        if not np.isfinite(val_metrics.get('total', float('nan'))):
-            consecutive_nan_epochs += 1
-            print(f'{epoch + 1:4d}  [NaN]')
-            if consecutive_nan_epochs >= 5:
-                print('5 consecutive NaN epochs. Stopping.')
+        if not np.isfinite(va.get('total', float('nan'))):
+            consecutive_nan += 1
+            print(f'{ep + 1:4d}  [NaN]')
+            if consecutive_nan >= 5:
                 break
             continue
-        consecutive_nan_epochs = 0
+        consecutive_nan = 0
 
-        r_err_sigma2 = val_metrics['r_err_sigma2']
-        r_vis_sigma2 = val_metrics['r_vis_sigma2']
-        r_err_ok     = r_err_sigma2 > cfg.target_r_err_sigma2
-        r_vis_ok     = r_vis_sigma2 < cfg.target_r_vis_sigma2
+        ev_ok = va['ev'] > 0.30
+        sv_ok = va['sv'] < -0.20
+        print(f"{ep+1:4d}  {va['total']:8.4f}  {va['ade']*POS_SCALE:6.2f}m  "
+              f"{'ok' if ev_ok else '  '}{va['ev']:6.3f}  "
+              f"{'ok' if sv_ok else '  '}{va['sv']:6.3f}  "
+              f"{lr_now:.2e}  {time.time()-t0:.1f}s")
 
-        print(
-            f"{epoch + 1:4d}  "
-            f"{val_metrics['total']:8.4f}  "
-            f"{val_metrics['min_ade'] * cfg.pos_scale:9.2f}  "
-            f"{'OK' if r_err_ok else '  '}{r_err_sigma2:7.3f}  "
-            f"{'OK' if r_vis_ok else '  '}{r_vis_sigma2:7.3f}  "
-            f"{current_lr:.2e}  "
-            f"({time.time() - t_start:.1f}s)"
-        )
+        score = va['ade'] + (0 if ev_ok else 5.0) + (0 if sv_ok else 5.0)
+        if np.isfinite(score) and score < best_score:
+            best_score = score
+            torch.save({'epoch': ep + 1, 'state': model.state_dict(),
+                        'ade': va['ade'], 'ev': va['ev'], 'sv': va['sv']},
+                       'best_model.pth')
+            print(f"       saved  ADE={va['ade']*POS_SCALE:.2f}m  "
+                  f"Err-r={va['ev']:.3f}  Vis-r={va['sv']:.3f}")
 
-        calibration_penalty = (0.0 if r_err_ok else 5.0) + (0.0 if r_vis_ok else 5.0)
-        composite_score = val_metrics['min_ade'] + calibration_penalty
+    with open('training_history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f'\nTraining complete. Best score: {best_score*POS_SCALE:.2f}m')
+    print('Saved: best_model.pth  training_history.json')
 
-        if np.isfinite(composite_score) and composite_score < best_composite_score:
-            best_composite_score = composite_score
-            torch.save(
-                {
-                    'epoch':        epoch + 1,
-                    'state_dict':   model.state_dict(),
-                    'min_ade':      val_metrics['min_ade'],
-                    'min_fde':      val_metrics['min_fde'],
-                    'r_err_sigma2': r_err_sigma2,
-                    'r_vis_sigma2': r_vis_sigma2,
-                    'config':       asdict(cfg),
-                },
-                cfg.checkpoint_path,
-            )
-            print(
-                f"       Checkpoint saved — "
-                f"minADE={val_metrics['min_ade'] * cfg.pos_scale:.2f}m  "
-                f"r(err,sigma2)={r_err_sigma2:.3f}  "
-                f"r(vis,sigma2)={r_vis_sigma2:.3f}"
-            )
 
-        if (
-            r_err_ok
-            and r_vis_ok
-            and epoch > cfg.early_stop_min_epoch
-            and val_metrics['min_ade'] * cfg.pos_scale < cfg.target_min_ade_m
-        ):
-            print(f'Both calibration targets met at epoch {epoch + 1}. Stopping.')
-            break
-
-    print(f'\nBest composite score: {best_composite_score:.4f}')
-    return history
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train UGIN')
+    parser.add_argument('--synthetic', action='store_true',
+                        help='Use synthetic dataset (no nuScenes download required)')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override epoch count from config.py')
+    main(parser.parse_args())
